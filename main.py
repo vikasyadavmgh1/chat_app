@@ -1,8 +1,30 @@
-# main.py
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+import boto3
+from botocore.exceptions import NoCredentialsError
 from typing import Dict, List
 
 app = FastAPI()
+
+# Middleware for CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust this in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# AWS S3 configuration
+AWS_ACCESS_KEY_ID = 'your_access_key_id'
+AWS_SECRET_ACCESS_KEY = 'your_secret_access_key'
+BUCKET_NAME = 'my-messaging-app-bucket'
+
+# Initialize the S3 client
+s3_client = boto3.client('s3', 
+                          aws_access_key_id=AWS_ACCESS_KEY_ID, 
+                          aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
 
 class ConnectionManager:
     def __init__(self):
@@ -45,6 +67,66 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+@app.get("/", response_class=HTMLResponse)
+async def main():
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Upload Media</title>
+    </head>
+    <body>
+        <h1>Upload Photo or Video to Send</h1>
+        <form id="uploadForm" action="/uploadfile/" method="post" enctype="multipart/form-data">
+            <label for="recipient">Enter Recipient ID:</label>
+            <input type="text" id="recipient" name="recipient" placeholder="Recipient ID" required>
+            <br><br>
+            <label for="file">Select Photo or Video:</label>
+            <input name="file" type="file" id="file" accept="image/*,video/*" required>
+            <button type="submit">Upload</button>
+        </form>
+        <div id="response"></div>
+        <script>
+            const form = document.getElementById("uploadForm");
+            form.onsubmit = async (event) => {
+                event.preventDefault();
+                const formData = new FormData(form);
+                const response = await fetch(form.action, {
+                    method: form.method,
+                    body: formData,
+                });
+                const result = await response.json();
+                if (result.url) {
+                    document.getElementById("response").innerHTML = `Media uploaded! <a href="${result.url}" target="_blank">Download Link</a>`;
+                    const recipientId = document.getElementById("recipient").value;
+                    const socket = new WebSocket(`ws://localhost:8000/ws/${recipientId}`);
+                    socket.onopen = () => {
+                        socket.send(JSON.stringify({ message: `User has sent a media file!`, url: result.url }));
+                    };
+                } else {
+                    console.error(result.error);
+                    document.getElementById("response").innerText = "Error uploading media.";
+                }
+            };
+        </script>
+    </body>
+    </html>
+    """)
+
+@app.post("/uploadfile/")
+async def upload_file(file: UploadFile = File(...)):
+    try:
+        file_location = file.filename
+        s3_client.upload_fileobj(file.file, BUCKET_NAME, file_location)
+        file_url = f"https://{BUCKET_NAME}.s3.amazonaws.com/{file_location}"
+        return {"filename": file.filename, "url": file_url}
+    except NoCredentialsError:
+        return {"error": "Credentials not available."}
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     # Connect the client
@@ -67,3 +149,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         # Disconnect the client if they disconnect
         manager.disconnect(client_id)
         await manager.broadcast(f"Client {client_id} has left the chat")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    print("Server shutting down...")  # Handle cleanup here if necessary
